@@ -1,0 +1,733 @@
+import inspect
+import torch
+import torch.distributed
+from typing import Optional, Dict, Any, Union, Tuple
+
+# from diffusers.models.embeddings import PatchEmbed
+from diffusers.models.transformers.transformer_flux import (
+    _get_qkv_projections,
+    FluxTransformer2DModel,
+    FluxAttnProcessor,
+    FluxAttention,
+)
+from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
+from diffusers.utils import (
+    is_torch_version,
+    scale_lora_layers,
+    USE_PEFT_BACKEND,
+    unscale_lora_layers,
+)
+from diffusers.models.attention import FeedForward
+from diffusers.models.embeddings import apply_rotary_emb
+
+from xfuser.core.distributed.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
+from xfuser.core.distributed import (
+    get_classifier_free_guidance_world_size,
+    get_classifier_free_guidance_rank,
+    get_sequence_parallel_world_size,
+    get_sequence_parallel_rank,
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+    get_cfg_group,
+    get_sp_group,
+)
+from xfuser.core.distributed.parallel_state import _SP
+
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.core.attention import registry as attention_registry
+from xfuser.core.attention.spec import Sparsity
+from xfuser.core.distributed.runtime_state import get_runtime_state
+
+from xfuser.logger import init_logger
+from xfuser.envs import PACKAGES_CHECKER
+from xfuser.model_executor.models.transformers.register import (
+    xFuserTransformerWrappersRegister,
+)
+from xfuser.model_executor.models.transformers.base_transformer import (
+    xFuserTransformerBaseWrapper,
+)
+from xfuser.model_executor.layers import xFuserLayerWrappersRegister
+from xfuser.model_executor.layers.attention_processor import (
+    xFuserAttentionBaseWrapper,
+    xFuserAttentionProcessorRegister,
+)
+from xfuser.model_executor.layers.usp import USP
+from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
+from xfuser.model_executor.models.transformers.transformers_utils import (
+    local_sp_pad_rows,
+    zero_sp_pad_rows_hook,
+)
+from xfuser.model_executor.layers.fused_qk_rope_flydsl import (
+    flydsl_fused_qk_norm_rope,
+    _HAS_FLYDSL,
+)
+
+logger = init_logger(__name__)
+
+env_info = PACKAGES_CHECKER.get_packages_info()
+HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+
+
+@xFuserLayerWrappersRegister.register(FluxAttention)
+class xFuserFluxAttentionWrapper(xFuserAttentionBaseWrapper):
+    def __init__(
+        self,
+        attention: FluxAttention,
+    ):
+        super().__init__(attention=attention)
+        self.processor = xFuserAttentionProcessorRegister.get_processor(attention.processor)()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
+        quiet_attn_parameters = {"ip_adapter_masks", "ip_hidden_states"}
+        unused_kwargs = [k for k, _ in kwargs.items() if k not in attn_parameters and k not in quiet_attn_parameters]
+        if len(unused_kwargs) > 0:
+            logger.warning(
+                f"joint_attention_kwargs {unused_kwargs} are not expected by {self.processor.__class__.__name__} and will be ignored."
+            )
+        kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
+        return self.processor(self, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kwargs)
+
+
+def _split_rotary_emb(image_rotary_emb, num_text_tokens: int, num_image_tokens: int):
+    """Split a diffusers ``(cos, sin)`` pair at the text/image boundary.
+
+    The joint FLUX stream is ``cat([text, image], dim=seq)`` and RoPE is a
+    strictly per-token map, so slicing the tables and applying RoPE to each
+    stream *before* the concat is bit-identical to applying it after.  Doing it
+    before is what lets QK-RMSNorm and RoPE collapse into one kernel per stream.
+
+    Returns ``(None, None)`` -- meaning "caller must apply RoPE post-concat" --
+    unless the table row count is exactly ``num_text_tokens + num_image_tokens``,
+    so any sequence-parallel slicing we do not understand stays on the safe path.
+    """
+    if image_rotary_emb is None:
+        return None, None
+    if not isinstance(image_rotary_emb, (tuple, list)) or len(image_rotary_emb) != 2:
+        # unsupported (e.g. complex) layout -- caller applies RoPE post-concat
+        return None, None
+    cos, sin = image_rotary_emb
+    if not isinstance(cos, torch.Tensor) or not isinstance(sin, torch.Tensor):
+        return None, None
+    if cos.dim() != 2 or cos.shape != sin.shape:
+        return None, None
+    if cos.shape[0] != num_text_tokens + num_image_tokens:
+        return None, None
+    txt = (cos[:num_text_tokens, :], sin[:num_text_tokens, :])
+    img = (cos[num_text_tokens:, :], sin[num_text_tokens:, :])
+    return txt, img
+
+
+def _sp_padding_attention_kwargs(local_kv_len: int, sp_padding: int):
+    """Exclude the image tokens padded for sequence parallelism from the keys.
+
+    The padding sits at the end of the last sequence-parallel rank's shard, so
+    in the keys gathered across all Ulysses and ring ranks it is a uniform
+    suffix; USP drops it from the Ulysses-gathered keys or, with ring
+    attention, from the shard each ring step attends to.
+    """
+    if not sp_padding:
+        return None
+    return {"valid_kv_len": get_sequence_parallel_world_size() * local_kv_len - sp_padding}
+
+
+@xFuserAttentionProcessorRegister.register(FluxAttnProcessor)
+class xFuserFluxAttnProcessor(FluxAttnProcessor):
+    def __init__(self):
+        super().__init__()
+        use_long_ctx_attn_kvcache = True
+        self.use_long_ctx_attn_kvcache = (
+            HAS_LONG_CTX_ATTN
+            and use_long_ctx_attn_kvcache
+            and _SP  # required for pipeline parallelism
+            and get_sequence_parallel_world_size() > 1
+        )
+
+    def __call__(
+        self,
+        attn: "FluxAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        sp_text_tokens: Optional[int] = None,
+        sp_padding: int = 0,
+    ) -> torch.Tensor:
+        """Joint text-image attention under xDiT's parallelism.
+
+        `sp_text_tokens` is the number of text tokens this rank holds, used to
+        split off the replicated prompt when it is not sharded across sequence
+        parallel ranks. `sp_padding` is the number of zero image tokens that
+        xFuserFlux1Transformer2DWrapper appended so the image sequence divides
+        the sequence parallel degree; they are excluded from the keys.
+        """
+        if sp_padding and get_runtime_state().num_pipeline_patch > 1:
+            raise NotImplementedError(
+                "FLUX.1 PipeFusion does not support image tokens padded for sequence parallelism."
+            )
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            num_encoder_hidden_states_tokens = encoder_query.shape[1]
+            num_query_tokens = query.shape[1]
+
+            if _HAS_FLYDSL:
+                # AITER/FlyDSL present: fuse QK-RMSNorm and RoPE into one kernel
+                # per stream. RoPE is per-token, so applying it before the joint
+                # concat over dim=1 is mathematically identical to applying it
+                # after.
+                txt_rope, img_rope = _split_rotary_emb(
+                    image_rotary_emb, num_encoder_hidden_states_tokens, num_query_tokens
+                )
+                encoder_query, encoder_key = flydsl_fused_qk_norm_rope(
+                    encoder_query,
+                    encoder_key,
+                    attn.norm_added_q,
+                    attn.norm_added_k,
+                    txt_rope,
+                )
+                query, key = flydsl_fused_qk_norm_rope(query, key, attn.norm_q, attn.norm_k, img_rope)
+
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+                if txt_rope is None and image_rotary_emb is not None:
+                    # tables could not be split -> apply RoPE on the joint stream
+                    query, key = flydsl_fused_qk_norm_rope(query, key, None, None, image_rotary_emb)
+            else:
+                # No AITER: the original unfused diffusers path (norm then rope
+                # on the joint stream), unchanged from before the fused kernel.
+                query = attn.norm_q(query)
+                key = attn.norm_k(key)
+                encoder_query = attn.norm_added_q(encoder_query)
+                encoder_key = attn.norm_added_k(encoder_key)
+
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+                if image_rotary_emb is not None:
+                    query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                    key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        else:
+            num_encoder_hidden_states_tokens = get_runtime_state().max_condition_sequence_length
+            num_query_tokens = query.shape[1] - num_encoder_hidden_states_tokens
+            if _HAS_FLYDSL:
+                query, key = flydsl_fused_qk_norm_rope(query, key, attn.norm_q, attn.norm_k, image_rotary_emb)
+            else:
+                query = attn.norm_q(query)
+                key = attn.norm_k(key)
+                if image_rotary_emb is not None:
+                    query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                    key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        distri_cache_updated = False
+        if get_runtime_state().num_pipeline_patch > 1 and not self.use_long_ctx_attn_kvcache:
+            encoder_hidden_states_key_proj, key = key.split([num_encoder_hidden_states_tokens, num_query_tokens], dim=1)
+            encoder_hidden_states_value_proj, value = value.split(
+                [num_encoder_hidden_states_tokens, num_query_tokens], dim=1
+            )
+            key, value = get_cache_manager().update_and_get_kv_cache(
+                new_kv=[key, value],
+                layer=attn,
+                slice_dim=1,
+                layer_type="attn",
+            )
+            key = torch.cat([encoder_hidden_states_key_proj, key], dim=1)
+            value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
+            distri_cache_updated = True
+
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        uses_pipeline_parallelism = get_runtime_state().num_pipeline_patch > 1
+        if not uses_pipeline_parallelism:
+            if get_runtime_state().split_text_embed_in_sp:
+                hidden_states = USP(
+                    query,
+                    key,
+                    value,
+                    combine_qkv_a2a=True,
+                    attn_layer=attn,
+                    attention_kwargs=_sp_padding_attention_kwargs(key.shape[2], sp_padding),
+                )
+            else:
+                # Every rank holds the whole prompt. Attend to it once as joint
+                # tokens: left in the sharded sequence, its keys would be
+                # gathered once per rank.
+                text_tokens = sp_text_tokens if sp_text_tokens is not None else num_encoder_hidden_states_tokens
+                joint_query, query = query.split([text_tokens, query.shape[2] - text_tokens], dim=2)
+                joint_key, key = key.split([text_tokens, key.shape[2] - text_tokens], dim=2)
+                joint_value, value = value.split([text_tokens, value.shape[2] - text_tokens], dim=2)
+                hidden_states = USP(
+                    query,
+                    key,
+                    value,
+                    combine_qkv_a2a=True,
+                    joint_query=joint_query,
+                    joint_key=joint_key,
+                    joint_value=joint_value,
+                    joint_strategy="front",
+                    attn_layer=attn,
+                    attention_kwargs=_sp_padding_attention_kwargs(key.shape[2], sp_padding),
+                )
+            hidden_states = hidden_states.transpose(1, 2)
+        else:
+            if get_runtime_state().split_text_embed_in_sp:
+                encoder_hidden_states_query_proj = None
+                encoder_hidden_states_key_proj = None
+                encoder_hidden_states_value_proj = None
+            else:
+                num_query_tokens_q = query.shape[2] - num_encoder_hidden_states_tokens
+                num_query_tokens_kv = key.shape[2] - num_encoder_hidden_states_tokens
+                encoder_hidden_states_query_proj, query = query.split(
+                    [num_encoder_hidden_states_tokens, num_query_tokens_q], dim=2
+                )
+                encoder_hidden_states_key_proj, key = key.split(
+                    [num_encoder_hidden_states_tokens, num_query_tokens_kv], dim=2
+                )
+                encoder_hidden_states_value_proj, value = value.split(
+                    [num_encoder_hidden_states_tokens, num_query_tokens_kv], dim=2
+                )
+            hidden_states = USP(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=False,
+                combine_qkv_a2a=True,
+                joint_query=encoder_hidden_states_query_proj,
+                joint_key=encoder_hidden_states_key_proj,
+                joint_value=encoder_hidden_states_value_proj,
+                joint_strategy="front",
+                attn_layer=None if distri_cache_updated else attn,
+                head_balance_layer=attn,
+            )
+            hidden_states = hidden_states.transpose(1, 2)
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+def flux_attn_modules(transformer) -> list[torch.nn.Module]:
+    """Self-attention modules of a Flux1/Flux2 transformer, in block order.
+
+    `single_transformer_blocks` is empty for pipefusion stages that hold none and for
+    Flux2 configs without them.
+    """
+    return [
+        block.attn
+        for block in (
+            *transformer.transformer_blocks,
+            *transformer.single_transformer_blocks,
+        )
+    ]
+
+
+class xFuserFlux1Transformer2DWrapper(FluxTransformer2DModel):
+    def __init__(
+        self,
+        patch_size: int = 1,
+        in_channels: int = 64,
+        out_channels: Optional[int] = None,
+        num_layers: int = 19,
+        num_single_layers: int = 38,
+        attention_head_dim: int = 128,
+        num_attention_heads: int = 24,
+        joint_attention_dim: int = 4096,
+        pooled_projection_dim: int = 768,
+        guidance_embeds: bool = False,
+        axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+    ):
+        super().__init__(
+            patch_size=patch_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_layers=num_layers,
+            num_single_layers=num_single_layers,
+            attention_head_dim=attention_head_dim,
+            num_attention_heads=num_attention_heads,
+            joint_attention_dim=joint_attention_dim,
+            pooled_projection_dim=pooled_projection_dim,
+            guidance_embeds=guidance_embeds,
+            axes_dims_rope=axes_dims_rope,
+        )
+
+        self._sp_pad = {"local_rows": 0}
+        # Both block kinds return (text, image); the pad trails the image stream.
+        for block in self.transformer_blocks + self.single_transformer_blocks:
+            block.attn.processor = xFuserFluxAttnProcessor()
+            block.register_forward_hook(zero_sp_pad_rows_hook(self._sp_pad, index=1))
+        register_fp8_comms_eligible_modules(self, flux_attn_modules(self))
+
+    def _pad_to_sp_divisible(self, tensor: torch.Tensor, padding_length: int, dim: int) -> torch.Tensor:
+        padding = torch.zeros(
+            *tensor.shape[:dim], padding_length, *tensor.shape[dim + 1 :], dtype=tensor.dtype, device=tensor.device
+        )
+        tensor = torch.cat([tensor, padding], dim=dim)
+        return tensor
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        *args,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        **kwargs,
+    ):
+        sp_world_size = get_sequence_parallel_world_size()
+        sequence_length = hidden_states.shape[1]
+        padding_length = (sp_world_size - (sequence_length % sp_world_size)) % sp_world_size
+        if padding_length > 0:
+            if padding_length >= (sequence_length + padding_length) // sp_world_size:
+                raise ValueError(
+                    f"{sequence_length} image tokens are too few to shard across "
+                    f"{sp_world_size} sequence parallel ranks."
+                )
+            hidden_states = self._pad_to_sp_divisible(hidden_states, padding_length, dim=1)
+            img_ids = self._pad_to_sp_divisible(img_ids, padding_length, dim=0)
+        assert hidden_states.shape[0] % get_classifier_free_guidance_world_size() == 0, (
+            f"Cannot split dim 0 of hidden_states ({hidden_states.shape[0]}) into {get_classifier_free_guidance_world_size()} parts."
+        )
+        text_length = encoder_hidden_states.shape[-2]
+        if text_length % sp_world_size != 0:
+            runtime_state = get_runtime_state()
+            # Replicated prompt joint tensors bypass FP8 all-to-all and calibration;
+            # fixed-scale communication would silently remain in bf16 as well.
+            if runtime_state.fp8_comms is not None:
+                raise ValueError(
+                    f"FLUX.1 --use_fp8_comms requires the prompt token count ({text_length}) "
+                    f"to be divisible by the sequence parallel degree ({sp_world_size}; "
+                    f"ulysses_degree={get_ulysses_parallel_world_size()}, "
+                    f"ring_degree={get_ring_parallel_world_size()}). "
+                    "Adjust --max_sequence_length or the parallel degrees, "
+                    "or disable --use_fp8_comms."
+                )
+            attention_spec = attention_registry.find(runtime_state.attention_backend)
+            if padding_length > 0 and attention_spec is not None and attention_spec.sparsity == Sparsity.VSA:
+                # USP() trims the pad keys of a joint call itself and clears valid_kv_len (#851), so
+                # AITER_VSA's dense path should not crop K/V again once the replicated prompt is joined.
+                # Remove this guard once that path is validated on AITER hardware.
+                raise NotImplementedError(
+                    f"FLUX.1 on {runtime_state.attention_backend.value} cannot pad "
+                    f"{sequence_length} image tokens for {sp_world_size} sequence parallel ranks "
+                    f"while the {text_length}-token prompt is replicated. Make the image token "
+                    "count or the prompt length divisible by the sequence parallel degree."
+                )
+            runtime_state.split_text_embed_in_sp = False
+        else:
+            get_runtime_state().split_text_embed_in_sp = True
+
+        if isinstance(timestep, torch.Tensor) and timestep.ndim != 0 and timestep.shape[0] == hidden_states.shape[0]:
+            timestep = torch.chunk(timestep, get_classifier_free_guidance_world_size(), dim=0)[
+                get_classifier_free_guidance_rank()
+            ]
+        hidden_states = torch.chunk(hidden_states, get_classifier_free_guidance_world_size(), dim=0)[
+            get_classifier_free_guidance_rank()
+        ]
+        hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
+            get_sequence_parallel_rank()
+        ]
+        self._sp_pad["local_rows"] = local_sp_pad_rows(
+            sequence_length, hidden_states.shape[1], get_sequence_parallel_rank()
+        )
+        encoder_hidden_states = torch.chunk(encoder_hidden_states, get_classifier_free_guidance_world_size(), dim=0)[
+            get_classifier_free_guidance_rank()
+        ]
+        if get_runtime_state().split_text_embed_in_sp:
+            encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=-2)[
+                get_sequence_parallel_rank()
+            ]
+        img_ids = torch.chunk(img_ids, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
+        if get_runtime_state().split_text_embed_in_sp:
+            txt_ids = torch.chunk(txt_ids, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
+
+        joint_attention_kwargs = dict(kwargs.pop("joint_attention_kwargs", None) or {})
+        joint_attention_kwargs.update(
+            sp_text_tokens=encoder_hidden_states.shape[-2],
+            sp_padding=padding_length,
+        )
+        output = super().forward(
+            hidden_states,
+            encoder_hidden_states,
+            *args,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            joint_attention_kwargs=joint_attention_kwargs,
+            **kwargs,
+        )
+
+        return_dict = not isinstance(output, tuple)
+        sample = output[0]
+        sample = get_sp_group().all_gather(sample, dim=-2)
+        sample = get_cfg_group().all_gather(sample, dim=0)
+        if padding_length > 0:
+            sample = sample[:, :-padding_length, :]
+        if return_dict:
+            return output.__class__(sample, *output[1:])
+        return (sample, *output[1:])
+
+
+@xFuserTransformerWrappersRegister.register(FluxTransformer2DModel)
+class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
+    def __init__(
+        self,
+        transformer: FluxTransformer2DModel,
+    ):
+        super().__init__(
+            transformer=transformer,
+            submodule_classes_to_wrap=([FeedForward] if get_tensor_model_parallel_world_size() > 1 else []),
+            submodule_name_to_wrap=["attn"],
+            transformer_blocks_name=["transformer_blocks", "single_transformer_blocks"],
+        )
+        self.encoder_hidden_states_cache = [None for _ in range(len(self.transformer_blocks))]
+        register_fp8_comms_eligible_modules(self, flux_attn_modules(self))
+
+    def pipefusion_compile_capture_forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        *args,
+        return_dict=True,
+        **kwargs,
+    ):
+        """Propagate only FLUX stage shapes during compile-signature capture."""
+        if is_pipeline_first_stage():
+            hidden_states = hidden_states.new_zeros((*hidden_states.shape[:-1], self.x_embedder.out_features))
+            encoder_hidden_states = encoder_hidden_states.new_zeros(
+                (*encoder_hidden_states.shape[:-1], self.context_embedder.out_features)
+            )
+        if is_pipeline_last_stage():
+            hidden_states = hidden_states.new_zeros((*hidden_states.shape[:-1], self.proj_out.out_features))
+            output = (hidden_states, None)
+        else:
+            output = (hidden_states, encoder_hidden_states)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        return_dict: bool = True,
+    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+        """
+        The [`FluxTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+                from the embeddings of input conditions.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        if joint_attention_kwargs is not None:
+            joint_attention_kwargs = joint_attention_kwargs.copy()
+            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
+        if is_pipeline_first_stage():
+            hidden_states = self.x_embedder(hidden_states)
+
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+        else:
+            guidance = None
+        temb = (
+            self.time_text_embed(timestep, pooled_projections)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, pooled_projections)
+        )
+        if is_pipeline_first_stage():
+            encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        if txt_ids.ndim == 3:
+            logger.warning(
+                "Passing `txt_ids` 3d torch.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d torch Tensor"
+            )
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            logger.warning(
+                "Passing `img_ids` 3d torch.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d torch Tensor"
+            )
+            img_ids = img_ids[0]
+
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb = self.pos_embed(ids)
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            if self.training and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb,
+                    **ckpt_kwargs,
+                )
+
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+            # controlnet residual
+            # if controlnet_block_samples is not None:
+            #     interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
+            #     interval_control = int(np.ceil(interval_control))
+            #     hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+
+        # if self.stage_info.after_flags["transformer_blocks"]:
+
+        for index_block, block in enumerate(self.single_transformer_blocks):
+            if self.training and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb,
+                    **ckpt_kwargs,
+                )
+
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+            # controlnet residual
+            # if controlnet_single_block_samples is not None:
+            #     interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
+            #     interval_control = int(np.ceil(interval_control))
+            #     hidden_states[:, encoder_hidden_states.shape[1] :, ...] = (
+            #         hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+            #         + controlnet_single_block_samples[index_block // interval_control]
+            #     )
+
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        encoder_hidden_states = hidden_states[:, : encoder_hidden_states.shape[1], ...]
+        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+
+        # The true last stage owns output projection even when its assigned
+        # block lists are empty (for example, PP degree greater than block count).
+        if is_pipeline_last_stage():
+            hidden_states = self.norm_out(hidden_states, temb)
+            output = self.proj_out(hidden_states), None
+        else:
+            output = hidden_states, encoder_hidden_states
+
+        if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
+            unscale_lora_layers(self, lora_scale)
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
+
+
+if __name__ == "__main__":
+    # print module in FluxTransformer2DModel
+    model = FluxTransformer2DModel()
